@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime
@@ -27,6 +28,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from triage_rules import analyze_transcript
+
+import emergency_services as emsvc
 
 AUDIO_TYPES = ["wav", "mp3", "aac", "aiff", "ogg", "opus", "flac", "mp4", "m4a", "amr", "wma", "webm"]
 
@@ -380,6 +383,52 @@ def get_sarvam_api_key() -> str | None:
     return value.strip() if value else None
 
 
+def get_geoapify_api_key() -> str | None:
+    """Streamlit Community Cloud secrets first; environment variable as fallback."""
+    try:
+        value = st.secrets.get("GEOAPIFY_API_KEY", None)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return emsvc.get_api_key()  # reads GEOAPIFY_API_KEY from the environment
+
+
+def get_google_places_api_key() -> str | None:
+    """Streamlit Secrets first; GOOGLE_PLACES_API_KEY environment variable as fallback."""
+    try:
+        value = st.secrets.get("GOOGLE_PLACES_API_KEY", None)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return emsvc.get_google_api_key()
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_emergency_search(
+    location: str, resource_types: tuple[str, ...], radius_m: int,
+    api_key: str, google_api_key: str | None = None,
+):
+    """Cache lookups for 15 min to respect API limits (keyed incl. both keys)."""
+    result = emsvc.find_nearby(
+        location, resource_types=resource_types, radius_m=radius_m,
+        api_key=api_key, google_api_key=google_api_key,
+    )
+    # Return a plain dict so Streamlit can hash/serialise the cached value cleanly.
+    return {
+        "query_location": result.query_location,
+        "coordinates": {
+            "lat": result.coordinates.lat,
+            "lon": result.coordinates.lon,
+            "formatted": result.coordinates.formatted,
+        },
+        "radius_m": result.radius_m,
+        "resources": {k: [r.as_dict() for r in v] for k, v in result.resources.items()},
+        "errors": result.errors,
+    }
+
+
 def transcribe_audio(audio_bytes: bytes, filename: str, mode: str) -> tuple[str, str | None]:
     """Transcribe a short audio clip with Sarvam Saaras v4."""
     api_key = get_sarvam_api_key()
@@ -540,8 +589,385 @@ def find_related_complaints(
 # Sidebar
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("### 🛡️ Operator Console")
-st.sidebar.caption("Fictional examples only.")
+st.sidebar.caption("Decision-support prototype · fictional examples only.")
 
+PAGE_TRIAGE = "🩺  Triage Dashboard"
+PAGE_PERFORMANCE = "📊  Model Performance"
+PAGE_EMERGENCY = "📍  Emergency Resources"
+nav = st.sidebar.radio(
+    "Navigate",
+    [PAGE_TRIAGE, PAGE_PERFORMANCE, PAGE_EMERGENCY],
+    label_visibility="collapsed",
+)
+
+st.sidebar.divider()
+st.sidebar.markdown("**System status**")
+if ml_predict("status check") is not None:
+    st.sidebar.success("ML triage model: loaded", icon="✅")
+else:
+    st.sidebar.error("ML model unavailable — keyword rules only.", icon="⚠️")
+if get_sarvam_api_key():
+    st.sidebar.success("Sarvam speech-to-text: configured", icon="🎙️")
+else:
+    st.sidebar.info("Sarvam key not set — typed transcripts still work.", icon="🎙️")
+if get_geoapify_api_key():
+    st.sidebar.success("Geoapify (maps/search): configured", icon="📍")
+else:
+    st.sidebar.info("Geoapify key not set — nearby-resources lookup off.", icon="📍")
+if get_google_places_api_key():
+    st.sidebar.success("Google Places (ratings/reviews): configured", icon="⭐")
+else:
+    st.sidebar.info("Google Places key not set — ratings/reviews off.", icon="⭐")
+
+st.sidebar.divider()
+st.sidebar.caption(
+    "Decision support only — this tool must never auto-dispatch emergency services. "
+    "Class scores / vote proportions are uncalibrated model outputs on synthetic data, "
+    "not probabilities of real-world correctness."
+)
+
+
+# -----------------------------------------------------------------------------
+# Page: Model Performance & Comparison (reads saved held-out evaluations)
+# -----------------------------------------------------------------------------
+def _load_eval_json(name: str) -> dict[str, Any] | None:
+    import json
+    try:
+        return json.loads((_MODELS2_DIR / name).read_text())
+    except Exception:
+        return None
+
+
+def _metrics_table(metric_block: dict[str, Any]) -> pd.DataFrame:
+    labels = ["PRIORITY_REVIEW", "SUPPORT_REVIEW", "UNCLEAR_REVIEW"]
+    rows = []
+    for lbl in labels:
+        pc = (metric_block.get("per_class") or {}).get(lbl, {})
+        rows.append({
+            "Class": ml_meta(lbl)["title"],
+            "Precision": f"{pc.get('precision', float('nan')):.3f}" if pc else "—",
+            "Recall": f"{pc.get('recall', float('nan')):.3f}" if pc else "—",
+            "F1": f"{pc.get('f1-score', float('nan')):.3f}" if pc else "—",
+            "Support": int(pc.get("support", 0)) if pc else 0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _confusion_df(metric_block: dict[str, Any]) -> pd.DataFrame | None:
+    cm = metric_block.get("confusion_matrix")
+    if not cm:
+        return None
+    short = ["PRIORITY", "SUPPORT", "UNCLEAR"]
+    return pd.DataFrame(cm, index=[f"true {s}" for s in short], columns=[f"pred {s}" for s in short])
+
+
+def render_performance() -> None:
+    with st.container(border=True):
+        card_header("Evaluation", "Model performance & comparison")
+        st.markdown(
+            '<div class="muted">Metrics are from saved, leakage-free held-out evaluations '
+            "(grouped train/val/test split by scenario family) on synthetic data. They are "
+            "not evidence of real-world performance.</div>",
+            unsafe_allow_html=True,
+        )
+
+    fusion = _load_eval_json("evaluation_fusion.json")
+    if not fusion:
+        st.warning("No saved evaluation found (models2.0/evaluation_fusion.json). Run the evaluation script to populate this page.")
+        return
+
+    models = [
+        ("Logistic Regression", fusion.get("logistic_regression", {})),
+        ("Semantic Evidence Voting", fusion.get("semantic_evidence_voting", {})),
+        ("Evidence Fusion", fusion.get("evidence_fusion", {})),
+    ]
+    with st.container(border=True):
+        card_header("Headline", f"Three-way comparison · {fusion.get('test_rows', '?')} held-out test rows")
+        cols = st.columns(3)
+        for col, (name, m) in zip(cols, models):
+            with col:
+                st.markdown(f"**{name}**")
+                st.metric("Macro F1", f"{m.get('macro_f1', float('nan')):.3f}")
+                st.metric("Accuracy", f"{m.get('accuracy', float('nan')):.3f}")
+                st.metric("PRIORITY recall", f"{m.get('priority_recall', float('nan')):.3f}")
+        best = max(models, key=lambda kv: kv[1].get("macro_f1", 0.0))[0]
+        st.caption(
+            f"Fusion weight (LogReg share) tuned on validation: {fusion.get('fusion_weight_logreg_share', '?')}. "
+            f"Highest macro F1: **{best}** — but the Fusion/LogReg gap here is within one test example, "
+            "so Fusion is best read as ≈ tied with LogReg, not a validated improvement."
+        )
+
+    for name, m in models:
+        with st.container(border=True):
+            card_header("Per class", name)
+            st.dataframe(_metrics_table(m), use_container_width=True, hide_index=True)
+            cm = _confusion_df(m)
+            if cm is not None:
+                st.markdown('<div class="eyebrow" style="margin-top:0.5rem;">Confusion matrix (rows = true)</div>', unsafe_allow_html=True)
+                st.dataframe(cm, use_container_width=True)
+
+    note = fusion.get("note")
+    if note:
+        st.caption(note)
+
+
+# -----------------------------------------------------------------------------
+# Page: Emergency Assistance & Nearby Resources (Geoapify + optional Google)
+# -----------------------------------------------------------------------------
+RESOURCE_LABELS = {
+    "police": "🚓 Police stations",
+    "hospital": "🏥 Hospitals",
+    "clinic": "🩺 Clinics",
+    "pharmacy": "💊 Pharmacies",
+    "ambulance": "🚑 Emergency / ambulance (hospital ER)",
+}
+# Marker colours (functional, distinct) — RGB for pydeck + hex for the legend.
+RESOURCE_COLORS = {
+    "police": ((60, 107, 109), "#3c6b6d"),
+    "hospital": ((176, 95, 69), "#b05f45"),
+    "clinic": ((169, 132, 63), "#a9843f"),
+    "pharmacy": ((126, 155, 132), "#7e9b84"),
+    "ambulance": ((192, 74, 58), "#c04a3a"),
+}
+ORIGIN_COLOR = (58, 56, 47)  # soft charcoal for the searched location
+
+
+def _render_map(data: dict, chosen: list[str]) -> None:
+    """Interactive pydeck map: colour-coded, hoverable markers + searched origin."""
+    try:
+        import pydeck as pdk
+    except Exception:
+        st.caption("Map unavailable (pydeck not installed) — see the cards below.")
+        return
+
+    coords = data["coordinates"]
+    points = []
+    for rtype in chosen:
+        rgb = RESOURCE_COLORS.get(rtype, ((100, 100, 100), "#666"))[0]
+        for r in data["resources"].get(rtype, []):
+            if r["lat"] is None or r["lon"] is None:
+                continue
+            rating = r.get("rating")
+            points.append({
+                "lat": r["lat"], "lon": r["lon"],
+                "name": r["name"],
+                "kind": RESOURCE_LABELS.get(rtype, rtype),
+                "distance": "—" if r["distance_km"] is None else f"{r['distance_km']} km",
+                "address": r["address"] or "Not available",
+                "phone": r["phone"] or "Not available",
+                "rating": f"{rating}★ ({r.get('reviews_count') or 0})" if rating else "Not available",
+                "color": list(rgb),
+            })
+    points.append({
+        "lat": coords["lat"], "lon": coords["lon"],
+        "name": "📍 Searched location", "kind": data["query_location"],
+        "distance": "—", "address": coords.get("formatted") or "", "phone": "—",
+        "rating": "—", "color": list(ORIGIN_COLOR),
+    })
+    df = pd.DataFrame(points)
+    layer = pdk.Layer(
+        "ScatterplotLayer", df, get_position="[lon, lat]", get_fill_color="color",
+        get_radius=60, radius_min_pixels=7, radius_max_pixels=22, pickable=True,
+        stroked=True, get_line_color=[255, 253, 248], line_width_min_pixels=1,
+    )
+    view = pdk.ViewState(latitude=coords["lat"], longitude=coords["lon"], zoom=12)
+    tooltip = {
+        "html": "<b>{name}</b><br/>{kind}<br/>📏 {distance}<br/>📍 {address}<br/>📞 {phone}<br/>⭐ {rating}",
+        "style": {"backgroundColor": "#3a382f", "color": "#fffdf8", "fontSize": "12px"},
+    }
+    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip,
+                             map_style="light"), use_container_width=True)
+    # Legend
+    legend = "".join(
+        f'<span class="chip" style="border-color:{RESOURCE_COLORS[t][1]};">'
+        f'<span style="color:{RESOURCE_COLORS[t][1]};font-weight:700;">●</span> {RESOURCE_LABELS[t]}</span>'
+        for t in chosen if t in RESOURCE_COLORS
+    )
+    st.markdown(f'<div style="margin-top:0.4rem;">{legend}</div>', unsafe_allow_html=True)
+
+
+def _stars(rating: float | None) -> str:
+    if not rating:
+        return ""
+    full = int(round(rating))
+    return "★" * full + "☆" * (5 - full)
+
+
+def _resource_card(r: dict) -> None:
+    """One scannable card: name, type, distance, address, phone, rating/reviews, links."""
+    with st.container(border=True):
+        dist = "" if r["distance_km"] is None else f'<span class="chip">📏 {r["distance_km"]} km</span>'
+        hexcol = RESOURCE_COLORS.get(r["type"], ((0, 0, 0), "#666"))[1]
+        type_chip = f'<span class="chip" style="border-color:{hexcol};color:{hexcol};font-weight:700;">{RESOURCE_LABELS.get(r["type"], r["type"])}</span>'
+        st.markdown(
+            f'<div class="card-title">{r["name"]}</div><div>{type_chip}{dist}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f'<div class="kv"><b>Address:</b> {r["address"] or "Not available"}</div>', unsafe_allow_html=True)
+
+        phone = r["phone"]
+        if phone:
+            tel = re.sub(r"[^0-9+]", "", phone)
+            st.markdown(f'<div class="kv"><b>Phone:</b> <a href="tel:{tel}">{phone}</a></div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="kv"><b>Phone:</b> Not available</div>', unsafe_allow_html=True)
+
+        rating = r.get("rating")
+        if rating:
+            st.markdown(
+                f'<div class="kv"><b>Rating:</b> <span style="color:#a9843f;">{_stars(rating)}</span> '
+                f'{rating} ({r.get("reviews_count") or 0} reviews)</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown('<div class="kv"><b>Rating / reviews:</b> Not available</div>', unsafe_allow_html=True)
+
+        links = []
+        if r.get("directions_url"):
+            links.append(f'<a href="{r["directions_url"]}" target="_blank">🧭 Directions</a>')
+        if r.get("google_url"):
+            links.append(f'<a href="{r["google_url"]}" target="_blank">🗺️ Google Maps listing</a>')
+        if links:
+            st.markdown('<div class="kv">' + " · ".join(links) + "</div>", unsafe_allow_html=True)
+
+        reviews = r.get("reviews") or []
+        if reviews:
+            with st.expander(f"Read {len(reviews)} Google review(s)"):
+                for rv in reviews:
+                    head = f"**{rv.get('author') or 'Anonymous'}**"
+                    if rv.get("rating"):
+                        head += f" · {_stars(rv['rating'])} {rv['rating']}"
+                    if rv.get("relative_time"):
+                        head += f" · {rv['relative_time']}"
+                    st.markdown(head)
+                    if rv.get("text"):
+                        st.caption(rv["text"])
+
+
+def render_emergency() -> None:
+    with st.container(border=True):
+        card_header("Emergency", "Nearby emergency resources")
+        st.markdown(
+            '<div class="muted">Informational lookup only — these listings do not dispatch '
+            "services and may be out of date. Always verify before acting.</div>",
+            unsafe_allow_html=True,
+        )
+
+    if not get_geoapify_api_key():
+        st.info(
+            "Nearby-resources lookup is disabled. Add `GEOAPIFY_API_KEY` to Streamlit Secrets "
+            "or the environment to enable it (free key at geoapify.com). Add `GOOGLE_PLACES_API_KEY` "
+            "too for phone numbers, ratings and reviews.",
+            icon="📍",
+        )
+        return
+
+    default_location = ""
+    if st.session_state.get("last_analysis"):
+        default_location = str(st.session_state.last_analysis.get("location") or "")
+        if default_location in ("Not identified", "Not identified."):
+            default_location = ""
+
+    with st.container(border=True):
+        with st.form("emergency_resources_form"):
+            loc = st.text_input(
+                "Location (city, area, or address)",
+                value=default_location,
+                placeholder="e.g. Connaught Place, New Delhi",
+            )
+            fc1, fc2 = st.columns([1, 1.4])
+            with fc1:
+                radius_km = st.slider("Search radius (km)", 1, 25, 5)
+            with fc2:
+                chosen = st.multiselect(
+                    "Resource types",
+                    options=list(RESOURCE_LABELS.keys()),
+                    default=list(emsvc.DEFAULT_RESOURCE_TYPES),
+                    format_func=lambda k: RESOURCE_LABELS.get(k, k),
+                )
+            submitted = st.form_submit_button("🔎 Find nearby resources", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+    if not loc.strip():
+        st.warning("Enter a location to search.", icon="⚠️")
+        return
+    if not chosen:
+        st.warning("Select at least one resource type.", icon="⚠️")
+        return
+
+    try:
+        with st.spinner("Searching nearby resources…"):
+            data = cached_emergency_search(
+                loc.strip(), tuple(chosen), int(radius_km) * 1000,
+                get_geoapify_api_key(), get_google_places_api_key(),
+            )
+    except emsvc.MissingApiKeyError:
+        st.error("Geoapify rejected the API key. Check GEOAPIFY_API_KEY.", icon="🔑")
+        return
+    except emsvc.LocationNotFoundError as exc:
+        st.error(str(exc), icon="🗺️")
+        return
+    except emsvc.ApiRequestError as exc:
+        st.error(f"Lookup failed: {exc}", icon="📡")
+        return
+    except emsvc.EmergencyServiceError as exc:
+        st.error(f"Lookup error: {exc}", icon="⚠️")
+        return
+
+    coords = data["coordinates"]
+    st.caption(
+        f"Matched **{coords['formatted'] or loc.strip()}** "
+        f"({coords['lat']:.4f}, {coords['lon']:.4f}) · radius {radius_km} km"
+    )
+    if data["errors"].get("_google"):
+        st.warning(f"Ratings/reviews unavailable: {data['errors']['_google']}", icon="⭐")
+    elif not get_google_places_api_key():
+        st.caption("Add GOOGLE_PLACES_API_KEY for phone numbers, ratings and reviews. Showing map/listing data only.")
+
+    total = sum(len(v) for v in data["resources"].values())
+    if total == 0:
+        st.info("No matching resources found within this radius. Try a wider radius or a different location.", icon="🔍")
+        return
+
+    with st.container(border=True):
+        card_header("Map", "Resource map")
+        _render_map(data, chosen)
+
+    for rtype in chosen:
+        items = data["resources"].get(rtype, [])
+        err = data["errors"].get(rtype)
+        st.markdown(f"#### {RESOURCE_LABELS.get(rtype, rtype)}")
+        if err:
+            st.caption(f"⚠️ {err}")
+        elif not items:
+            st.caption("No results in range.")
+        else:
+            card_cols = st.columns(2)
+            for i, r in enumerate(items):
+                with card_cols[i % 2]:
+                    _resource_card(r)
+
+    st.caption(
+        "Listings are OpenStreetMap-derived via Geoapify; phone, ratings and reviews (where shown) "
+        "come from Google Places and are matched by name and location — they may be incomplete or "
+        "imperfectly matched. Fields without a confident match read 'Not available'. Informational "
+        "only — this tool never contacts or dispatches emergency services."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Page dispatch — other pages render then stop; triage is the fall-through
+# -----------------------------------------------------------------------------
+if nav == PAGE_PERFORMANCE:
+    render_performance()
+    st.stop()
+if nav == PAGE_EMERGENCY:
+    render_emergency()
+    st.stop()
+
+
+# --- Triage Dashboard controls (sidebar) -----------------------------------
 sample_choice = st.sidebar.selectbox(
     "Load an example transcript",
     ["Custom transcript", *SAMPLE_TRANSCRIPTS.keys()],
@@ -551,9 +977,6 @@ if st.session_state.get("_last_sample_choice") != sample_choice:
     st.session_state.transcript_input = SAMPLE_TRANSCRIPTS.get(sample_choice, "")
     st.session_state._last_sample_choice = sample_choice
 
-st.sidebar.divider()
-
-# Model selector: Logistic Regression (default), SEV, and Evidence Fusion.
 _sev_ok = sev_available()
 _fusion_ok = fusion_available()
 _method_options = [METHOD_LOGREG]
@@ -575,33 +998,8 @@ triage_method = st.sidebar.radio(
 if not _sev_ok:
     st.sidebar.caption("Semantic Evidence Voting / Fusion unavailable (needs sentence-transformers + built index).")
 st.sidebar.caption(
-    "Held-out macro F1 (train/val/test split) — LogReg 0.772 · SEV 0.615 · Fusion 0.776. "
-    "Fusion is marginally best (≈ tied with LogReg; +1 example); SEV is weaker on this "
-    "romanized-Hinglish corpus. No method is claimed as a validated improvement."
-)
-
-if ml_predict("status check") is not None:
-    st.sidebar.success("ML triage model: loaded", icon="✅")
-else:
-    st.sidebar.error("ML model unavailable — keyword rules only.", icon="⚠️")
-if get_sarvam_api_key():
-    st.sidebar.success("Sarvam API key: configured", icon="🎙️")
-else:
-    st.sidebar.info("Sarvam key not set — typed transcripts still work.", icon="🎙️")
-
-st.sidebar.markdown("**Pipeline (v2.1)**")
-st.sidebar.markdown(
-    "- ML classifier · word+char TF-IDF → Logistic Regression (`models2.0`)\n"
-    "- Experimental · Semantic Evidence Voting (multilingual embeddings)\n"
-    "- Transparent keyword evidence (`triage_rules`)\n"
-    "- Optional Sarvam AI speech-to-text\n"
-    "- Location & missing-detail flags\n"
-    "- Lexical similarity (thresholded)\n"
-    "- Session-only case history"
-)
-st.sidebar.caption(
-    "Class scores / vote proportions are uncalibrated model outputs, not probabilities "
-    "of real-world correctness."
+    "Held-out macro F1 — LogReg 0.772 · SEV 0.615 · Fusion 0.776. See the Model Performance "
+    "page for the full comparison. No method is claimed as a validated improvement."
 )
 
 
